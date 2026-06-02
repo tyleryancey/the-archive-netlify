@@ -1,0 +1,14 @@
+# The Archive — Netlify config.
+# Static PWA files live at the repo root; the NYT proxy is a function.
+
+[build]
+  publish = "."
+  functions = "netlify/functions"
+
+# Make /svc/archive/* same-origin: rewrite (status 200) to the proxy function.
+# Same-origin means the browser applies no CORS at all.
+[[redirects]]
+  from = "/svc/archive/*"
+  to = "/.netlify/functions/nyt-archive/:splat"
+  status = 200
+  force = true
