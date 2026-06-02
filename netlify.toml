@@ -5,6 +5,11 @@
   publish = "."
   functions = "netlify/functions"
 
+# Ensure a Node runtime that has global fetch (18+). Avoids a 502 from an
+# older default runtime where fetch is undefined.
+[build.environment]
+  NODE_VERSION = "20"
+
 # Make /svc/archive/* same-origin: rewrite (status 200) to the proxy function.
 # Same-origin means the browser applies no CORS at all.
 [[redirects]]
