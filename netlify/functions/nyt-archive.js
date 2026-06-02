@@ -1,13 +1,17 @@
 /*
  * nyt-archive — Netlify function that proxies the NYT Archive API.
  *
- * Because it's served from your site's own origin (via the /svc/archive/*
- * rewrite in netlify.toml), the browser treats the call as same-origin and
- * applies no CORS at all. CORS headers are still included so this also works
- * if you ever point a differently-hosted app at it.
+ * IMPORTANT: Netlify caps a synchronous function's response at ~6 MB, and an
+ * Archive *month* is far larger than that (it includes every article, print and
+ * web, with full metadata). So this function does the heavy lifting server-side:
+ * it fetches the month, keeps only PRINT articles, and returns just the fields
+ * the app uses. That shrinks ~30 MB down to ~1-2 MB — under the cap — while
+ * keeping the SAME response shape ({ response: { docs: [...] } }), so the app
+ * needs no changes.
  *
- * Needs the Node 18+ runtime (for global fetch), which is Netlify's default.
- * Your NYT key travels only between your device and your own site.
+ * Served from your site's own origin via the /svc/archive/* rewrite, so the
+ * browser applies no CORS. Your NYT key travels only between your device and
+ * your own site. Needs Node 18+ (global fetch); see NODE_VERSION in netlify.toml.
  */
 
 function corsHeaders() {
@@ -19,15 +23,33 @@ function corsHeaders() {
   };
 }
 
-function resp(statusCode, body, headers) {
-  return { statusCode, headers: headers || corsHeaders(), body };
+function jsonResp(statusCode, obj) {
+  const headers = corsHeaders();
+  headers["Content-Type"] = "application/json; charset=utf-8";
+  return { statusCode, headers, body: JSON.stringify(obj) };
+}
+
+// Keep only the fields the app reads, so the response stays small.
+function slimDoc(d) {
+  const h = d.headline || {};
+  return {
+    web_url: d.web_url || "",
+    headline: { main: h.main || "", print_headline: h.print_headline || "" },
+    print_page: d.print_page,
+    print_section: d.print_section || "",
+    section_name: d.section_name || "",
+    news_desk: d.news_desk || "",
+    byline: { original: (d.byline && d.byline.original) || "" },
+    abstract: d.abstract || d.snippet || d.lead_paragraph || "",
+    pub_date: d.pub_date || "",
+  };
 }
 
 exports.handler = async (event) => {
-  if (event.httpMethod === "OPTIONS") return resp(204, "", corsHeaders());
-  if (event.httpMethod !== "GET") return resp(405, "Method not allowed");
+  if (event.httpMethod === "OPTIONS") return { statusCode: 204, headers: corsHeaders(), body: "" };
+  if (event.httpMethod !== "GET") return jsonResp(405, { error: "Method not allowed" });
 
-  // Recover the requested path + query. event.rawUrl is the original request URL.
+  // Recover the requested path + query (handle original or rewritten form).
   let pathname = "";
   let search = "";
   try {
@@ -38,8 +60,6 @@ exports.handler = async (event) => {
     pathname = event.path || "";
     search = event.rawQuery ? "?" + event.rawQuery : "";
   }
-
-  // Resolve the archive path whether we see the original URL or the function path.
   let archive = null;
   const i = pathname.indexOf("/svc/archive/");
   if (i !== -1) {
@@ -48,18 +68,39 @@ exports.handler = async (event) => {
     const m = pathname.indexOf("/nyt-archive/");
     if (m !== -1) archive = "/svc/archive/" + pathname.slice(m + "/nyt-archive/".length);
   }
-  if (!archive) return resp(404, "Only /svc/archive/ is proxied.");
+  if (!archive) return jsonResp(404, { error: "Only /svc/archive/ is proxied." });
 
   const target = "https://api.nytimes.com" + archive + search;
+
+  let upstream;
   try {
-    const upstream = await fetch(target, { headers: { Accept: "application/json" } });
-    const body = await upstream.text();
-    const headers = corsHeaders();
-    headers["Content-Type"] = upstream.headers.get("content-type") || "application/json; charset=utf-8";
-    return { statusCode: upstream.status, headers, body };
+    upstream = await fetch(target, { headers: { Accept: "application/json" } });
   } catch (e) {
-    const headers = corsHeaders();
-    headers["Content-Type"] = "application/json; charset=utf-8";
-    return { statusCode: 502, headers, body: JSON.stringify({ error: "Upstream fetch failed" }) };
+    return jsonResp(502, { error: "Upstream fetch failed: " + (e && e.message ? e.message : "unknown") });
   }
+
+  // Pass small error bodies (401/429/etc.) straight through so the app reacts.
+  if (!upstream.ok) {
+    const text = await upstream.text();
+    const headers = corsHeaders();
+    headers["Content-Type"] = upstream.headers.get("content-type") || "application/json";
+    return { statusCode: upstream.status, headers, body: text.slice(0, 4096) };
+  }
+
+  let data;
+  try {
+    data = await upstream.json();
+  } catch (e) {
+    return jsonResp(502, { error: "Could not parse the NYT response." });
+  }
+
+  const docs = (data && data.response && data.response.docs) || [];
+  const slim = [];
+  for (let k = 0; k < docs.length; k++) {
+    const d = docs[k];
+    if (!String(d.print_page || "").trim()) continue; // print edition only
+    slim.push(slimDoc(d));
+  }
+
+  return jsonResp(200, { response: { docs: slim } });
 };
