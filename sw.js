@@ -1,5 +1,5 @@
 // The Archive — service worker. Bump CACHE when the app shell changes.
-const CACHE = "archive-v3";
+const CACHE = "archive-v6";
 const SHELL = [
   "./",
   "./index.html",
